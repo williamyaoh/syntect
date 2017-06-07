@@ -8,6 +8,7 @@ mod yaml_load;
 mod syntax_set;
 #[cfg(feature = "parsing")]
 mod parser;
+mod context_ptr;
 
 mod scope;
 

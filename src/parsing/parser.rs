@@ -7,284 +7,280 @@ use std::i32;
 use std::hash::BuildHasherDefault;
 use fnv::FnvHasher;
 
-/// Keeps the current parser state (the internal syntax interpreter stack) between lines of parsing.
-/// If you are parsing an entire file you create one of these at the start and use it
-/// all the way to the end.
-///
-/// # Caching
-///
-/// One reason this is exposed is that since it implements `Clone` you can actually cache
-/// these (probably along with a `HighlightState`) and only re-start parsing from the point of a change.
-/// See the docs for `HighlightState` for more in-depth discussion of caching.
-///
-/// This state doesn't keep track of the current scope stack and parsing only returns changes to this stack
-/// so if you want to construct scope stacks you'll need to keep track of that as well.
-/// Note that `HighlightState` contains exactly this as a public field that you can use.
-///
-/// **Note:** Caching is for advanced users who have tons of time to maximize performance or want to do so eventually.
-/// It is not recommended that you try caching the first time you implement highlighting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseState {
-    stack: Vec<StateLevel>,
-    first_line: bool,
+  scope_stack: Vec<StateLevel>,
+  applied_meta_context: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StateLevel {
-    context: ContextPtr,
-    prototype: Option<ContextPtr>,
-    captures: Option<(Region, String)>,
+  context: ContextPtr,
+  prototype: Option<ContextPtr>,
+  captures: Option<(Region, String)>,
 }
 
+/// Presumably this is used as an intermediate data structure to create
+/// the captures for `StateLevel`.
 #[derive(Debug)]
 struct RegexMatch {
-    regions: Region,
-    context: ContextPtr,
-    pat_index: usize,
+  captures: Region,
+  context: ContextPtr,
+  pat_index: usize, // TODO: Figure out what this does.
 }
 
-/// maps the pattern to the start index, which is -1 if not found.
-type SearchCache = HashMap<*const MatchPattern, Option<Region>, BuildHasherDefault<FnvHasher>>;
-type MatchedPatterns = HashSet<*const MatchPattern, BuildHasherDefault<FnvHasher>>;
+/// A cache of match results so we don't have to re-search the buffer
+/// when text changes.
+type SearchCache =
+  HashMap<*const MatchPattern, Option<Region>, BuildHasherDefault<FnvHasher>>;
+type MatchedPatterns =
+  HashSet<*const MatchPattern, BuildHasherDefault<FnvHasher>>;
 
 impl ParseState {
-    /// Create a state from a syntax, keeps its own reference counted
-    /// pointer to the main context of the syntax.
-    pub fn new(syntax: &SyntaxDefinition) -> ParseState {
-        let start_state = StateLevel {
-            // __start is a special context we add in yaml_load.rs
-            context: syntax.contexts["__start"].clone(),
-            prototype: None,
-            captures: None,
-        };
-        ParseState {
-            stack: vec![start_state],
-            first_line: true,
-        }
+  /// Create a parser to parse the given syntax.
+  pub fn new(syntax: &SyntaxDefinition) -> ParseState {
+    let start_state = StateLevel {
+      // __start is a special context we add in yaml_load.rs
+      context: syntax.contexts["__start"].clone(),
+      prototype: None,
+      captures: None,
+    };
+
+    ParseState {
+      scope_stack: vec![start_state],
+      applied_meta_context: true,
+    }
+  }
+
+  /// Feed in a single line (of UTF8) to our parser. Get back a sequence
+  /// of parsing results.
+  pub fn parse_line(&mut self, line: &str) -> Vec<(usize, ScopeStackOp)> {
+    assert!(self.scope_stack.len() > 0,
+            "Somehow main context was popped from the stack");
+
+    // Looks like these are for just the indices in the text.
+    let mut match_start = 0;
+    let mut prev_match_start = 0;
+
+    let mut result = Vec::new();
+
+    // Presumably if we've gotten to this point, then our parent context
+    // has already stripped off our starting match and added the context
+    // to it.
+    if self.applied_meta_context {
+      let cur_level = &self.scope_stack[self.scope_stack.len() - 1];
+      let context = cur_level.context.borrow();
+      if !context.meta_content_scope.is_empty() {
+        result.push((0, ScopeStackOp::Push(context.meta_content_scope[0])));
+      }
+      // Why does this only happen once? We might have inner contexts inside
+      // this context, right?
+      self.applied_meta_context = false;
     }
 
-    /// Parses a single line of the file. Because of the way regex engines work you unfortunately
-    /// have to pass in a single line contigous in memory. This can be bad for really long lines.
-    /// Sublime Text avoids this by just not highlighting lines that are too long (thousands of characters).
-    ///
-    /// For efficiency reasons this returns only the changes to the current scope at each point in the line.
-    /// You can use `ScopeStack#apply` on each operation in succession to get the stack for a given point.
-    /// Look at the code in `highlighter.rs` for an example of doing this for highlighting purposes.
-    ///
-    /// The vector is in order both by index to apply at (the `usize`) and also by order to apply them at a
-    /// given index (e.g popping old scopes before pusing new scopes).
-    pub fn parse_line(&mut self, line: &str) -> Vec<(usize, ScopeStackOp)> {
-        assert!(self.stack.len() > 0,
-                "Somehow main context was popped from the stack");
-        let mut match_start = 0;
-        let mut prev_match_start = 0;
-        let mut res = Vec::new();
+    let mut regions = Region::with_capacity(8);
+    let fnv = BuildHasherDefault::<FnvHasher>::default();
+    let mut search_cache: SearchCache =
+      HashMap::with_capacity_and_hasher(128, fnv);
+    let fnv2 = BuildHasherDefault::<FnvHasher>::default();
+    // Fixes issue https://github.com/trishume/syntect/issues/25
+    let mut matched: MatchedPatterns = HashSet::with_capacity_and_hasher(4, fnv2);
 
-        if self.first_line {
-            let cur_level = &self.stack[self.stack.len() - 1];
-            let context = cur_level.context.borrow();
-            if !context.meta_content_scope.is_empty() {
-                res.push((0, ScopeStackOp::Push(context.meta_content_scope[0])));
-            }
-            self.first_line = false;
-        }
-
-        let mut regions = Region::with_capacity(8);
-        let fnv = BuildHasherDefault::<FnvHasher>::default();
-        let mut search_cache: SearchCache = HashMap::with_capacity_and_hasher(128, fnv);
-        let fnv2 = BuildHasherDefault::<FnvHasher>::default();
-        // Fixes issue https://github.com/trishume/syntect/issues/25
-        let mut matched: MatchedPatterns = HashSet::with_capacity_and_hasher(4, fnv2);
-
-        while self.parse_next_token(line,
-                                    &mut match_start,
-                                    &mut search_cache,
-                                    &mut matched,
-                                    &mut regions,
-                                    &mut res) {
-            // We only care about not repeatedly matching things at the same location
-            if match_start != prev_match_start {
-                matched.clear();
-            }
-            prev_match_start = match_start;
-        }
-
-        res
+    while self.parse_next_token(line,
+                                &mut match_start,
+                                &mut search_cache,
+                                &mut matched,
+                                &mut regions,
+                                &mut result) 
+    {
+      // We only care about not repeatedly matching things at the same location
+      if match_start != prev_match_start {
+        matched.clear();
+      }
+      prev_match_start = match_start;
     }
 
-    fn parse_next_token(&mut self,
-                        line: &str,
-                        start: &mut usize,
-                        search_cache: &mut SearchCache,
-                        matched: &mut MatchedPatterns,
-                        regions: &mut Region,
-                        ops: &mut Vec<(usize, ScopeStackOp)>)
-                        -> bool {
-        let cur_match = {
-            let cur_level = &self.stack[self.stack.len() - 1];
-            let mut min_start = usize::MAX;
-            let mut cur_match: Option<RegexMatch> = None;
-            let prototype: Option<ContextPtr> = {
-                let ctx_ref = cur_level.context.borrow();
-                ctx_ref.prototype.clone()
+    result
+  }
+
+  /// Mutably parse the next token and add it to our stack of
+  /// results.
+  fn parse_next_token(&mut self,
+                      line: &str,
+                      start: &mut usize,
+                      search_cache: &mut SearchCache,
+                      matched: &mut MatchedPatterns,
+                      regions: &mut Region,
+                      ops: &mut Vec<(usize, ScopeStackOp)>)
+      -> bool 
+  {
+    let token_match = {
+      let cur_level = &self.scope_stack[self.scope_stack.len() - 1];
+      let mut min_start = usize::MAX;
+      let mut cur_match: Option<RegexMatch> = None;
+      let prototype: Option<ContextPtr> = {
+        let ctx_ref = cur_level.context.borrow();
+        ctx_ref.prototype.clone()
+      };
+      let context_chain = self.scope_stack
+        .iter()
+        .rev() // iterate the stack in top-down order to apply the prototypes
+        .filter_map(|lvl| lvl.prototype.as_ref().cloned())
+        .chain(prototype.into_iter())
+        .chain(Some(cur_level.context.clone()).into_iter());
+      for ctx in context_chain {
+        for (pat_context_ptr, pat_index) in context_iter(ctx) {
+          let mut pat_context = pat_context_ptr.borrow_mut();
+          let mut match_pat = pat_context.match_at_mut(pat_index);
+          let match_ptr = match_pat as *const MatchPattern;
+
+          // Avoid matching the same pattern twice in the same place, causing an infinite loop
+          if matched.contains(&match_ptr) {
+            continue;
+          }
+
+          if let Some(maybe_region) = search_cache.get(&match_ptr) {
+            let mut valid_entry = true;
+            if let Some(ref region) = *maybe_region {
+              let match_start = region.pos(0).unwrap().0;
+              if match_start < *start {
+                valid_entry = false;
+              } else if match_start < min_start {
+                min_start = match_start;
+                cur_match = Some(RegexMatch {
+                  captures: region.clone(),
+                  context: pat_context_ptr.clone(),
+                  pat_index: pat_index,
+                });
+              }
+            }
+            if valid_entry {
+              continue;
+            }
+          }
+
+          // !!! IMPORTANT. SOURCE OF INTERIOR MUTABILITY. !!!
+          // TODO: Investigate this.
+          match_pat.ensure_compiled_if_possible();
+
+          let refs_regex = 
+            if match_pat.has_captures && cur_level.captures.is_some() {
+              let &(ref region, ref s) = cur_level.captures.as_ref().unwrap();
+              Some(match_pat.compile_with_refs(region, s))
+            } else {
+              None
             };
-            let context_chain = self.stack
-                .iter().rev() // iterate the stack in top-down order to apply the prototypes
-                .filter_map(|lvl| lvl.prototype.as_ref().cloned())
-                .chain(prototype.into_iter())
-                .chain(Some(cur_level.context.clone()).into_iter());
-            // println!("{:#?}", cur_level);
-            // println!("token at {} on {}", start, line.trim_right());
-            for ctx in context_chain {
-                for (pat_context_ptr, pat_index) in context_iter(ctx) {
-                    let mut pat_context = pat_context_ptr.borrow_mut();
-                    let mut match_pat = pat_context.match_at_mut(pat_index);
-                    // println!("{} - {:?} - {:?}", match_pat.regex_str, match_pat.has_captures, cur_level.captures.is_some());
-                    let match_ptr = match_pat as *const MatchPattern;
-
-                    // Avoid matching the same pattern twice in the same place, causing an infinite loop
-                    if matched.contains(&match_ptr) {
-                        continue;
-                    }
-
-                    if let Some(maybe_region) =
-                           search_cache.get(&match_ptr) {
-                        let mut valid_entry = true;
-                        if let Some(ref region) = *maybe_region {
-                            let match_start = region.pos(0).unwrap().0;
-                            if match_start < *start {
-                                valid_entry = false;
-                            } else if match_start < min_start {
-                                // print!("match {} at {} on {}", match_pat.regex_str, match_start, line);
-                                min_start = match_start;
-                                cur_match = Some(RegexMatch {
-                                    regions: region.clone(),
-                                    context: pat_context_ptr.clone(),
-                                    pat_index: pat_index,
-                                });
-                            }
-                        }
-                        if valid_entry {
-                            continue;
-                        }
-                    }
-
-                    match_pat.ensure_compiled_if_possible();
-                    let refs_regex = if match_pat.has_captures && cur_level.captures.is_some() {
-                        let &(ref region, ref s) = cur_level.captures.as_ref().unwrap();
-                        Some(match_pat.compile_with_refs(region, s))
-                    } else {
-                        None
-                    };
-                    let regex = if let Some(ref rgx) = refs_regex {
-                        rgx
-                    } else {
-                        match_pat.regex.as_ref().unwrap()
-                    };
-                    let matched = regex.search_with_options(line,
-                                                            *start,
-                                                            line.len(),
-                                                            onig::SEARCH_OPTION_NONE,
-                                                            Some(regions));
-                    if let Some(match_start) = matched {
-                        let match_end = regions.pos(0).unwrap().1;
-                        // this is necessary to avoid infinite looping on dumb patterns
-                        let does_something = match match_pat.operation {
-                            MatchOperation::None => match_start != match_end,
-                            _ => true,
-                        };
-                        if refs_regex.is_none() && does_something {
-                            search_cache.insert(match_pat, Some(regions.clone()));
-                        }
-                        if match_start < min_start && does_something {
-                            // print!("catch {} at {} on {}", match_pat.regex_str, match_start, line);
-                            min_start = match_start;
-                            cur_match = Some(RegexMatch {
-                                regions: regions.clone(),
-                                context: pat_context_ptr.clone(),
-                                pat_index: pat_index,
-                            });
-                        }
-                    } else if refs_regex.is_none() {
-                        search_cache.insert(match_pat, None);
-                    }
-                }
+          let regex =
+            if let Some(ref rgx) = refs_regex {
+              rgx
+            } else {
+              match_pat.regex.as_ref().unwrap()
+            };
+          let matched = regex.search_with_options(line,
+              *start,
+              line.len(),
+              onig::SEARCH_OPTION_NONE,
+              Some(regions));
+          if let Some(match_start) = matched {
+            let match_end = regions.pos(0).unwrap().1;
+            // this is necessary to avoid infinite looping on dumb patterns
+            let does_something = match match_pat.operation {
+              MatchOperation::None => match_start != match_end,
+                _ => true,
+            };
+            if refs_regex.is_none() && does_something {
+              search_cache.insert(match_pat, Some(regions.clone()));
             }
-            cur_match
-        };
-
-        if let Some(reg_match) = cur_match {
-            let (_, match_end) = reg_match.regions.pos(0).unwrap();
-            *start = match_end;
-            let level_context = self.stack[self.stack.len() - 1].context.clone();
-            self.exec_pattern(line, reg_match, level_context, matched, ops);
-            true
-        } else {
-            false
+            if match_start < min_start && does_something {
+              // print!("catch {} at {} on {}", match_pat.regex_str, match_start, line);
+              min_start = match_start;
+              cur_match = Some(RegexMatch {
+                captures: regions.clone(),
+                context: pat_context_ptr.clone(),
+                pat_index: pat_index,
+              });
+            }
+          } else if refs_regex.is_none() {
+            search_cache.insert(match_pat, None);
+          }
         }
+      }
+
+      cur_match
+    };
+
+    if let Some(reg_match) = token_match {
+      let (_, match_end) = reg_match.captures.pos(0).unwrap();
+      *start = match_end;
+      let level_context =
+        self.scope_stack[self.scope_stack.len() - 1].context.clone();
+      self.exec_pattern(line, reg_match, level_context, matched, ops);
+      true
+    } else {
+      false
     }
+  }
 
-    /// Returns true if the stack was changed
-    fn exec_pattern(&mut self,
-                    line: &str,
-                    reg_match: RegexMatch,
-                    level_context_ptr: ContextPtr,
-                    matched: &mut MatchedPatterns,
-                    ops: &mut Vec<(usize, ScopeStackOp)>)
-                    -> bool {
-        let (match_start, match_end) = reg_match.regions.pos(0).unwrap();
-        let context = reg_match.context.borrow();
-        let pat = context.match_at(reg_match.pat_index);
-        let level_context = level_context_ptr.borrow();
-        // println!("running pattern {:?} on '{}' at {}", pat.regex_str, line, match_start);
+  fn exec_pattern(&mut self,
+                  line: &str,
+                  reg_match: RegexMatch,
+                  level_context_ptr: ContextPtr,
+                  matched: &mut MatchedPatterns,
+                  ops: &mut Vec<(usize, ScopeStackOp)>)
+    -> bool 
+  {
+    let (match_start, match_end) = reg_match.captures.pos(0).unwrap();
+    let context = reg_match.context.borrow();
+    let pat = context.match_at(reg_match.pat_index);
+    let level_context = level_context_ptr.borrow();
 
-        // We only worry about keeping track to avoid infinite loops on pushes and sets
-        // So that we fix #25 but don't break like #28
-        match pat.operation {
-            MatchOperation::Push(_) |
-            MatchOperation::Set(_) => {
-                matched.insert(pat as *const MatchPattern);
-            },
-            MatchOperation::Pop | MatchOperation:: None => ()
-        };
+    // We only worry about keeping track to avoid infinite loops on pushes and sets
+    // So that we fix #25 but don't break like #28
+    match pat.operation {
+      MatchOperation::Push(_) |
+      MatchOperation::Set(_) => {
+        matched.insert(pat as *const MatchPattern);
+      },
+      MatchOperation::Pop |
+      MatchOperation::None => ()
+    };
 
-        self.push_meta_ops(true, match_start, &*level_context, &pat.operation, ops);
-        for s in &pat.scope {
-            // println!("pushing {:?} at {}", s, match_start);
-            ops.push((match_start, ScopeStackOp::Push(*s)));
-        }
-        if let Some(ref capture_map) = pat.captures {
-            // captures could appear in an arbitrary order, have to produce ops in right order
-            // ex: ((bob)|(hi))* could match hibob in wrong order, and outer has to push first
-            // we don't have to handle a capture matching multiple times, Sublime doesn't
-            let mut map: Vec<((usize, i32), ScopeStackOp)> = Vec::new();
-            for &(cap_index, ref scopes) in capture_map.iter() {
-                if let Some((cap_start, cap_end)) = reg_match.regions.pos(cap_index) {
-                    // marking up empty captures causes pops to be sorted wrong
-                    if cap_start == cap_end {
-                        continue;
-                    }
-                    // println!("capture {:?} at {:?}-{:?}", scopes[0], cap_start, cap_end);
-                    for scope in scopes.iter() {
-                        map.push(((cap_start, -((cap_end - cap_start) as i32)),
-                                  ScopeStackOp::Push(*scope)));
-                    }
-                    map.push(((cap_end, i32::MIN), ScopeStackOp::Pop(scopes.len())));
-                }
-            }
-            map.sort_by(|a, b| a.0.cmp(&b.0));
-            for ((index, _), op) in map.into_iter() {
-                ops.push((index, op));
-            }
-        }
-        if !pat.scope.is_empty() {
-            // println!("popping at {}", match_end);
-            ops.push((match_end, ScopeStackOp::Pop(pat.scope.len())));
-        }
-        self.push_meta_ops(false, match_end, &*level_context, &pat.operation, ops);
-
-        self.perform_op(line, &reg_match.regions, pat)
+    self.push_meta_ops(true, match_start, &*level_context, &pat.operation, ops);
+    for s in &pat.scope {
+      ops.push((match_start, ScopeStackOp::Push(*s)));
     }
+    if let Some(ref capture_map) = pat.captures {
+      // captures could appear in an arbitrary order, have to produce ops in right order
+      // ex: ((bob)|(hi))* could match hibob in wrong order, and outer has to push first
+      // we don't have to handle a capture matching multiple times, Sublime doesn't
+      let mut map: Vec<((usize, i32), ScopeStackOp)> = Vec::new();
+      for &(cap_index, ref scopes) in capture_map.iter() {
+        if let Some((cap_start, cap_end)) = reg_match.captures.pos(cap_index) {
+          // marking up empty captures causes pops to be sorted wrong
+          if cap_start == cap_end {
+            continue;
+          }
+          // println!("capture {:?} at {:?}-{:?}", scopes[0], cap_start, cap_end);
+          for scope in scopes.iter() {
+            map.push(((cap_start, -((cap_end - cap_start) as i32)),
+                  ScopeStackOp::Push(*scope)));
+          }
+          map.push(((cap_end, i32::MIN), ScopeStackOp::Pop(scopes.len())));
+        }
+      }
+      map.sort_by(|a, b| a.0.cmp(&b.0));
+      for ((index, _), op) in map.into_iter() {
+        ops.push((index, op));
+      }
+    }
+    if !pat.scope.is_empty() {
+      // println!("popping at {}", match_end);
+      ops.push((match_end, ScopeStackOp::Pop(pat.scope.len())));
+    }
+    self.push_meta_ops(false, match_end, &*level_context, &pat.operation, ops);
+
+    self.perform_op(line, &reg_match.captures, pat)
+  }
 
     fn push_meta_ops(&self,
                      initial: bool,
@@ -395,11 +391,11 @@ impl ParseState {
         let ctx_refs = match pat.operation {
             MatchOperation::Push(ref ctx_refs) => ctx_refs,
             MatchOperation::Set(ref ctx_refs) => {
-                self.stack.pop();
+                self.scope_stack.pop();
                 ctx_refs
             }
             MatchOperation::Pop => {
-                self.stack.pop();
+                self.scope_stack.pop();
                 return true;
             }
             MatchOperation::None => return false,
@@ -419,7 +415,7 @@ impl ParseState {
                     None
                 }
             };
-            self.stack.push(StateLevel {
+            self.scope_stack.push(StateLevel {
                 context: ctx_ptr,
                 prototype: proto,
                 captures: captures,
